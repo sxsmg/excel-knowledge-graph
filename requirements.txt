@@ -1,0 +1,10 @@
+gspread
+oauth2client            # for Google Sheets auth
+openpyxl
+networkx
+neo4j
+fastapi                # later, for our API layer
+uvicorn
+llama-index 
+llama-index-graph-stores-nebula
+llama-index-graph-stores-neo4j
