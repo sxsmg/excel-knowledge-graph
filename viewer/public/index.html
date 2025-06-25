@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Spreadsheet Dependency Graph</title>
+
+  <style>
+    #viz{width:100%;max-width:1100px;height:700px;margin:2rem auto;border:1px solid #ccc}
+    #askbox{display:flex;gap:.5rem;justify-content:center;margin-top:1rem;font-family:system-ui,sans-serif}
+    #answer{margin-top:.75rem;text-align:center;font-weight:600}
+  </style>
+
+  <script src="/neovis.js"></script>  <!--  full bundle, no vis-network tag -->
+</head>
+<body onload="draw()">
+  <div id="viz"></div>
+
+  <!-- quick NL-query box -->
+  <div id="askbox">
+    <input id="q" size="60"
+           placeholder="Ask something like: Which cells break if I change Sales!C2?">
+    <button onclick="submitQ()">Ask</button>
+  </div>
+  <div id="answer"></div>
+
+  <script>
+    let viz;
+
+    async function draw(){
+      const cfg = await fetch("/config").then(r=>r.json())
+                                       .catch(()=>null);
+      if(!cfg){return document.getElementById("viz").innerText="❌  /config missing";}
+
+      const config = {
+        containerId : "viz",
+        neo4j : { serverUrl:cfg.uri, serverUser:cfg.user, serverPassword:cfg.password },
+        initialCypher : "MATCH (n)-[r]->(m) RETURN n,r,m LIMIT 300"
+      };
+
+      viz = new NeoVis.default(config);
+      viz.render();
+
+      /* optional: strip vis network’s old-school CSS */
+      viz.registerOnEvent("completed", () =>
+        document.querySelectorAll("style[type*='text/css']").forEach(s=>s.remove())
+      );
+    }
+
+    async function submitQ(){
+      const question = document.getElementById("q").value.trim();
+      if(!question) return;
+      document.getElementById("answer").innerText = "…thinking…";
+      try{
+        const res = await fetch("/ask",
+          {method:"POST",headers:{"Content-Type":"application/json"},
+           body:JSON.stringify({question})}).then(r=>r.json());
+        document.getElementById("answer").innerText = res.answer ?? "⚠️ No answer";
+      }catch(e){
+        document.getElementById("answer").innerText = "⚠️ API error";
+      }
+    }
+  </script>
+</body>
+</html>
