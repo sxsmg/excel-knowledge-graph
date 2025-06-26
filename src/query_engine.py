@@ -1,70 +1,69 @@
 # src/query_engine.py
-"""
-A very thin “smart-question” layer on top of the existing Neo4j graph store.
-"""
 
 from functools import lru_cache
+import re
+
 from llama_index.core import PropertyGraphIndex
 from llama_index.core.indices.property_graph import TextToCypherRetriever
+
+from .graph_store import graph_store
 from .llm import llm
+from .patches import clean_cypher
 
-from .config import Settings
-from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
-
-_cfg = Settings()
-
-print("LLM API KEY", _cfg.LLM_API_KEY)
-
-graph_store = Neo4jPropertyGraphStore(
-    url=_cfg.NEO4J_URI,
-    username=_cfg.NEO4J_USER,
-    password=_cfg.NEO4J_PASSWORD,
-    database=_cfg.NEO4J_DATABASE,
-)
+# Pre‐compile our “break impact” pattern:
+_BREAK_RE = re.compile(r"which cells break if i change\s+([\w!]+)\?", re.IGNORECASE)
 
 @lru_cache(maxsize=1)
 def _index() -> PropertyGraphIndex:
-    """Wrap the current Neo4j store exactly once."""
     return PropertyGraphIndex.from_existing(property_graph_store=graph_store)
 
-
 @lru_cache(maxsize=1)
-def _query_engine():
-    """Build a retriever+engine (cached)."""
-    cypher_retriever = TextToCypherRetriever(
+def _make_retriever():
+    return TextToCypherRetriever(
         graph_store,
         llm=llm,
         text_to_cypher_template=graph_store.text_to_cypher_template,
-        response_template=("Generated Cypher:\n{query}\n\n"
-                           "Results:\n{response}"),
-    )
-    return _index().as_query_engine(
-        include_text=False,
-        verbose=False,
-        sub_retrievers=[cypher_retriever],
+        response_template="{query}"
     )
 
-
-# --------------------------------------------------------------------------- #
-#  Public helper imported by api.py
-# --------------------------------------------------------------------------- #
 def ask_question(question: str) -> dict:
     """
-    Free-form QA entry point used by /v1/ask.
-
-    Parameters
-    ----------
-    question : str
-        Natural-language prompt, e.g. “Which cells break if I change Sales!C2?”
-
-    Returns
-    -------
-    dict
-        {"question": ..., "answer": ...}
+    Try matching our “Which cells break if I change X?” pattern first,
+    and run a pure‐Cypher lookup.  Otherwise, fall back to LLM→Cypher.
     """
-    engine = _query_engine()
-    answer = engine.query(question)
-    return {
-        "question": question,
-        "answer": str(answer).strip(),
-    }
+    m = _BREAK_RE.match(question.strip())
+    if m:
+        cell = m.group(1)
+        # run direct Cypher for dependents:
+        from .graph_store import driver, Settings as _S
+        cy = """
+        MATCH (s:entity {name:$cell})
+        MATCH (s)-[:DEPENDS_ON*1..]->(d:entity)
+        RETURN DISTINCT d.name AS dep
+        """
+        with driver().session(database=_S().NEO4J_DATABASE) as ses:
+            deps = [r["dep"] for r in ses.run(cy, cell=cell)]
+        ans = f"Cells {', '.join(deps) or '—none—'} would break if you change {cell}."
+        return {"question": question, "answer": ans}
+
+    # otherwise, let Llama‐Index generate a Cypher query,
+    # clean off any ``` fences, and execute it for us too:
+    retriever = _make_retriever()
+    # depending on Llama‐Index version:
+    if hasattr(retriever, "generate_cypher"):
+        raw = retriever.generate_cypher(question)
+    else:
+        raw = retriever.to_cypher({"query_str": question})
+    cypher = clean_cypher(str(raw))
+
+    # if it's a read‐only Cypher, run it:
+    if cypher.upper().startswith("MATCH"):
+        from .graph_store import driver, Settings as _S
+        with driver().session(database=_S().NEO4J_DATABASE) as ses:
+            result = ses.run(cypher)
+            rows = [record.values() for record in result]
+        ans = {"cypher": cypher, "rows": rows}
+        return {"question": question, "answer": ans}
+
+    # else, just return the generated Cypher:
+    return {"question": question, "answer": {"cypher": cypher}}

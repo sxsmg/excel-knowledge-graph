@@ -3,7 +3,7 @@
 from openpyxl import load_workbook
 from openpyxl.utils import range_boundaries, get_column_letter
 import networkx as nx
-from parser import extract_dependencies
+from .parser import extract_dependencies
 
 def expand_range(start: str, end: str):
     """Given "A1","B3" returns all cells in that rectangle."""

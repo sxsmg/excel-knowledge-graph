@@ -3,9 +3,16 @@ from .config import Settings
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 from llama_index.core.graph_stores.types import EntityNode, Relation
 
-
 _cfg = Settings()  # singleton
 
+
+# --------------------------------------------------------------------------- #
+graph_store = Neo4jPropertyGraphStore(
+    url=_cfg.NEO4J_URI,
+    username=_cfg.NEO4J_USER,
+    password=_cfg.NEO4J_PASSWORD,
+    database=_cfg.NEO4J_DATABASE,
+)
 
 def driver():
     return GraphDatabase.driver(
@@ -20,12 +27,7 @@ def clear_db():
 
 
 def store_for_llama():
-    return Neo4jPropertyGraphStore(
-        url=_cfg.NEO4J_URI,
-        username=_cfg.NEO4J_USER,
-        password=_cfg.NEO4J_PASSWORD,
-        database=_cfg.NEO4J_DATABASE
-    )
+    return graph_store 
 
 
 def upsert_graph(nx_graph):
