@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Spreadsheet-Brain Viewer</title>
+
+  <style>
+    body { font-family: system-ui; margin: 0; }
+    #toolbar {
+      display: flex; gap: 6px; align-items: center;
+      padding: 8px; background: #fafafa; border-bottom: 1px solid #ddd;
+    }
+    #query { flex: 1; padding: 6px; font-size: 14px; }
+    button { padding: 6px 14px; font-size: 14px; cursor: pointer; }
+    #status { font-size: 12px; color: #555; margin-left: 4px; user-select: none; }
+    #answer {
+      position: absolute; top: 56px; right: 16px; max-width: 320px;
+      background: #fff; border: 1px solid #ccc; border-radius: 4px;
+      padding: 8px; font-size: 14px; box-shadow: 0 2px 6px rgba(0,0,0,.12);
+      display: none;
+    }
+    #viz { width: 100%; height: calc(100vh - 50px); }
+  </style>
+
+  <!-- these are served by viewer/server.js -->
+  <script src="/neovis.js"></script>
+  <script src="/vis-network.min.js"></script>
+</head>
+
+<body onload="init()">
+  <div id="toolbar">
+    <input id="query"
+           placeholder="Ask or update (e.g. 'Which cells break if I change Sales!C2?')" />
+    <button onclick="sendRun()">Run</button>
+    <button onclick="draw(currentMeta)">Reload</button>
+    <span id="status"></span>
+  </div>
+
+  <div id="answer"></div>
+  <div id="viz"></div>
+
+<script>
+let viz, cfg, currentMeta;
+const API = "http://localhost:8000";
+
+async function init() {
+  // 1) load Neo4j creds
+  cfg = await fetch("/config").then(r => r.json());
+  // 2) load labels/types for styling
+  currentMeta = await fetch(`${API}/labels`).then(r => r.json());
+  draw(currentMeta);
+  // 3) subscribe to real-time updates
+  const es = new EventSource(`${API}/events`);
+  es.onmessage = () => {
+    setStatus("🔄 update event, re-drawing…");
+    fetch(`${API}/labels`)
+      .then(r => r.json())
+      .then(meta => { currentMeta = meta; draw(meta); });
+  };
+}
+
+function draw(meta) {
+  // build a { [LabelName]: { caption: 'name' } } map dynamically
+  const labelConfig = Object.fromEntries(
+    meta.nodeLabels.map(l => [ l, { caption: "name" } ])
+  );
+  // build a { [RelType]: { caption: false } } map
+  const relConfig = Object.fromEntries(
+    meta.relTypes.map(r => [ r, { caption: false } ])
+  );
+
+  const config = {
+    containerId : "viz",
+    neo4j       : {
+      serverUrl     : cfg.uri,
+      serverUser    : cfg.user,
+      serverPassword: cfg.password
+    },
+    labels        : labelConfig,
+    relationships : relConfig,
+    arrows        : true,  // show directed arrows
+    initialCypher : "MATCH (n)-[r]->(m) RETURN n,r,m LIMIT 300"
+  };
+
+  if (!window.NeoVis?.default) {
+    return setStatus("❌ NeoVis bundle missing");
+  }
+  setStatus("Rendering graph…");
+  viz = new NeoVis.default(config);
+  viz.render();
+  viz.registerOnEvent("completed", () => setStatus("✅ graph ready"));
+}
+
+function setStatus(txt) {
+  document.getElementById("status").textContent = txt;
+}
+
+// unified “Ask or Update” button
+async function sendRun() {
+  const instr = document.getElementById("query").value.trim();
+  if (!instr) return;
+  setStatus("⏳ running…");
+  document.getElementById("answer").style.display = "none";
+
+  try {
+    const res = await fetch(`${API}/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ instruction: instr })
+    }).then(r => r.json());
+
+    if (res.rows) {
+      const txt = `⏺ ${res.rows.length} row${res.rows.length!==1?'s':''}`;
+      document.getElementById("answer").textContent = txt;
+      document.getElementById("answer").style.display = "block";
+      setStatus(`✅ read (${txt})`);
+    } else {
+      setStatus(`✅ write applied: ${res.cypher}`);
+      draw(currentMeta);  // redraw to reflect mutation
+    }
+  } catch (e) {
+    setStatus("❌ " + (e.detail || e.message));
+  }
+}
+</script>
+</body>
+</html>

@@ -182,65 +182,64 @@ def notify_update():
 
 @app.get("/graph", response_class=HTMLResponse)
 def graph_view():
-    """
-    Render the full spreadsheet‐brain dependency graph as a pyvis HTML page.
-    """
-    # 1) Pull every dependency from Neo4j
-    CYPHER = """
-    MATCH (n:entity)-[r:DEPENDS_ON]->(m:entity)
-    RETURN n.name AS source, m.name AS target
-    """
+    # ─── Build the graph from Neo4j ──────────────────────────────────────────
+    NODE_CYPHER = "MATCH (n:entity) RETURN n.name AS id, n.color AS color"
+    EDGE_CYPHER = "MATCH (a:entity)-[:DEPENDS_ON]->(b:entity) RETURN a.name AS source, b.name AS target"
+
     G = nx.DiGraph()
-    with _neo4j_driver().session(database=_settings.NEO4J_DATABASE) as ses:
-        for rec in ses.run(CYPHER):
-            src = rec["source"]
-            dst = rec["target"]
-            # add nodes (pyvis will dedupe), and an edge
-            G.add_node(src, title=src)
-            G.add_node(dst, title=dst)
-            G.add_edge(src, dst)
+    drv = _neo4j_driver()
+    with drv.session(database=_settings.NEO4J_DATABASE) as ses:
+        for rec in ses.run(NODE_CYPHER):
+            nid, col = rec["id"], rec["color"]
+            G.add_node(nid, title=nid, label=nid, color=col or "#97c2fc")
+        for rec in ses.run(EDGE_CYPHER):
+            G.add_edge(rec["source"], rec["target"])
 
-    # 2) Build the pyvis network
-    net = Network(
-        height="750px",
-        width="100%",
-        directed=True,
-        notebook=False,
-        bgcolor="#ffffff",
-        font_color="#000000",
-    )
+    # ─── Generate the PyVis HTML ────────────────────────────────────────────
+    net = Network(height="750px", width="100%", directed=True, notebook=False)
     net.from_nx(G)
-
-    # Optional: tweak defaults for all nodes
-    for node in net.nodes:
-        node["size"]  = 20
-        node["label"] = node["id"]
-        node["title"] = node["id"]
-
-    # 3) Render straight to HTML and return
+    for n in net.nodes:
+        n["size"] = 20
     html = net.generate_html()
+
+    # ─── Swap out broken /lib/… for CDN assets ───────────────────────────────
     html = (
-        html
-        .replace(
-            '<link rel="stylesheet" href="/lib/vis-network.min.css">',
-            '<link rel="stylesheet" '
-            'href="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/vis-network.min.css">'
-        )
-        .replace(
-            '<script src="/lib/vis-network.min.js"></script>',
-            '<script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/vis-network.min.js"></script>'
-        )
-        # PyVis inlines its utils.js in the HTML already; if it still emits a /lib binding:
-        .replace('<script src="/lib/bindings/utils.js"></script>', '')
+      html
+      .replace(
+        '<link rel="stylesheet" href="/lib/vis-network.min.css">',
+        '<link rel="stylesheet" '
+        'href="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/vis-network.min.css">'
+      )
+      .replace(
+        '<script src="/lib/vis-network.min.js"></script>',
+        '<script '
+        'src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/vis-network.min.js">'
+        '</script>'
+      )
+      .replace('src="/lib/bindings/utils.js"', '')
+      .replace('src="lib/bindings/utils.js"', '')
     )
+
+    # ─── Inject the toolbar + dynamic‐highlighting JS ────────────────────────
     tool_ui = """
       <div style="padding:8px; background:#fafafa; border-bottom:1px solid #ddd;">
-        <input id="query" placeholder="Enter question or update…" style="width:60%;padding:6px" />
-        <button id="runBtn" style="padding:6px 12px">Run</button>
+        <input id="query" placeholder="Enter question or update…"
+               style="width:60%;padding:6px;font-size:14px" />
+        <button id="runBtn" style="padding:6px 12px;font-size:14px">Run</button>
         <span id="status" style="margin-left:8px;color:#555"></span>
       </div>
       <script>
-        // NL → /run
+        // Capture the PyVis network instance
+        let pyvisNetwork;
+        const prevOnload = window.onload || (()=>{});
+        window.onload = () => {
+          prevOnload();
+          pyvisNetwork = network;  // 'network' is the global from PyVis
+        };
+
+        // Remember what we highlighted last
+        let lastHighlights = [];
+
         document.getElementById("runBtn").onclick = async () => {
           const q = document.getElementById("query").value.trim();
           if (!q) return;
@@ -251,20 +250,35 @@ def graph_view():
             body: JSON.stringify({instruction: q})
           });
           const j = await res.json();
-          document.getElementById("status").textContent =
-            j.rows ? "✅ done" : (j.status || "✅ write applied");
+
+          if (j.rows) {
+            // Clear old highlights
+            lastHighlights.forEach(id => {
+              pyvisNetwork.body.data.nodes.update({ id, color: undefined });
+            });
+            // Highlight new results in yellow
+            const hits = j.rows.flat();
+            hits.forEach(id => {
+              pyvisNetwork.body.data.nodes.update({
+                id,
+                color: { background: "#ffff00" }
+              });
+            });
+            lastHighlights = hits;
+            document.getElementById("status").textContent = "✅ highlighted";
+          } else {
+            // It's a write: rely on SSE to reload the page
+            document.getElementById("status").textContent = j.status || "✅ done";
+          }
         };
 
-        // SSE reload on external updates or writes
+        // SSE listener for external or write-triggered reloads
         const es = new EventSource("/events");
-        es.onmessage = () => {
-          console.log("⚡️ reload event, refreshing graph");
-          window.location.reload();
-        };
+        es.onmessage = () => window.location.reload();
       </script>
     """
 
-    # insert the toolbar right after <body>
+    # Splice the toolbar into the HTML just after <body>
     html = html.replace("<body>", "<body>" + tool_ui)
-    print("final HTML", html)
+
     return HTMLResponse(html)
