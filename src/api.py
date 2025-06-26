@@ -1,101 +1,129 @@
 # src/api.py
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from neo4j import GraphDatabase
 
-from .query_engine import ask_question
-from .graph_store import driver, Settings as _S
-from .patches import clean_cypher
-from llama_index.core.indices.property_graph import TextToCypherRetriever
+from llama_index.llms.openai import OpenAI
+from llama_index.program.openai import OpenAIPydanticProgram
+from llama_index.core.prompts.base import ChatPromptTemplate
+from llama_index.core.chat_engine.types import ChatMessage
+
+from .config import Settings
 from .graph_store import graph_store
-from .llm import llm
 
-app = FastAPI(title="Spreadsheet Brain API")
+# ──────────────────────────────────────────────────────────────
+# 1) Our “function‐style” Pydantic schema for any Cypher query
+# ──────────────────────────────────────────────────────────────
+class CypherQuery(BaseModel):
+    """
+    A valid Neo4j Cypher statement (read or write).
+    """
+    cypher: str = Field(..., description="A valid Cypher query")
 
-# allow our viewer (3000) → API (8000)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+
+class Instruction(BaseModel):
+    instruction: str
+
+
+# ──────────────────────────────────────────────────────────────
+# 2) Spin up the LLM + Pydantic program for NL→Cypher
+# ──────────────────────────────────────────────────────────────
+_llm = OpenAI(model="gpt-4", temperature=0)
+_prompt = ChatPromptTemplate(
+    message_templates=[
+        ChatMessage(
+            role="system",
+            content=(
+                "You are a Neo4j expert.  Given a user instruction, "
+                "produce ONLY a valid Cypher statement—either a read query "
+                "(MATCH/RETURN) or a write operation (CREATE, MERGE, SET, DELETE)."
+            ),
+        ),
+        ChatMessage(role="user", content="{instruction}"),
+    ]
+)
+_program = OpenAIPydanticProgram.from_defaults(
+    llm=_llm,
+    prompt=_prompt,
+    output_cls=CypherQuery,
+    verbose=False,
 )
 
-class ImpactRequest(BaseModel):
-    cell: str
 
-class AskPayload(BaseModel):
-    question: str
+# ──────────────────────────────────────────────────────────────
+# 3) FastAPI setup
+# ──────────────────────────────────────────────────────────────
+app = FastAPI(title="Spreadsheet Brain API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
 
-class UpdatePayload(BaseModel):
-    question: str
-
-
-@app.post("/impact")
-def impact(req: ImpactRequest):
-    cy = """
-    MATCH (s:entity {name:$cell})
-    MATCH (s)-[:DEPENDS_ON*1..]->(d:entity)
-    RETURN DISTINCT d.name AS dep
-    """
-    with driver().session(database=_S().NEO4J_DATABASE) as ses:
-        deps = [r["dep"] for r in ses.run(cy, cell=req.cell)]
-    return {"source": req.cell, "dependents": deps}
-
-
-@app.post("/ask")
-@app.post("/v1/ask")
-def ask(payload: AskPayload):
-    try:
-        return ask_question(payload.question)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/update")
-def update_graph(payload: UpdatePayload):
-    """
-    NL → Cypher → write transaction → return confirmation
-    """
-    retriever = TextToCypherRetriever(
-        graph_store,
-        llm=llm,
-        text_to_cypher_template=graph_store.text_to_cypher_template,
+# helper to get a neo4j Driver
+_settings = Settings()
+def _neo4j_driver():
+    return GraphDatabase.driver(
+        _settings.NEO4J_URI,
+        auth=(_settings.NEO4J_USER, _settings.NEO4J_PASSWORD),
     )
-    # pick the right method
-    if hasattr(retriever, "generate_cypher"):
-        raw = retriever.generate_cypher(payload.question)
-    else:
-        raw = retriever.to_cypher({"query_str": payload.question})
-    cypher = clean_cypher(str(raw))
-
-    head = cypher.split(None, 1)[0].upper()
-    if head not in {"CREATE", "MERGE", "DELETE", "SET"}:
-        raise HTTPException(400, detail=f"LLM did not produce a write statement:\n{cypher}")
-
-    with driver().session(database=_S().NEO4J_DATABASE) as ses:
-        ses.run(cypher)
-
-    return {"answer": "Graph updated", "cypher": cypher}
 
 
 @app.get("/labels", response_class=JSONResponse)
 def labels():
     """
-    Return existing node‐labels & relationship‐types for the viewer legend.
+    Return current node‐labels & relationship‐types for the viewer legend.
     """
     CYPHER = """
-    MATCH (n)            RETURN DISTINCT labels(n) AS labs
-    UNION
-    MATCH ()-[r]->()     RETURN DISTINCT type(r)  AS labs
+      MATCH (n) RETURN DISTINCT labels(n) AS labs
+      UNION
+      MATCH ()-[r]->() RETURN DISTINCT type(r) AS labs
     """
     nodes, rels = set(), set()
-    with driver().session(database=_S().NEO4J_DATABASE) as ses:
+    drv = _neo4j_driver()
+    with drv.session(database=_settings.NEO4J_DATABASE) as ses:
         for rec in ses.run(CYPHER):
-            labs = rec["labs"]
-            if isinstance(labs, list):
-                nodes.update(labs)
+            v = rec["labs"]
+            if isinstance(v, list):
+                nodes.update(v)
             else:
-                rels.add(labs)
+                rels.add(v)
     return {"nodeLabels": sorted(nodes), "relTypes": sorted(rels)}
+
+
+@app.post("/run")
+def run_cypher(cmd: Instruction):
+    """
+    Single “run” endpoint that:
+      • NL → Cypher (via our Pydantic program)
+      • auto‐detect read vs write
+      • execute against Neo4j
+      • return { cypher, rows } for reads or { cypher, status } for writes
+    """
+    # 1) Generate Cypher
+    try:
+        out: CypherQuery = _program(instruction=cmd.instruction)
+    except Exception as e:
+        raise HTTPException(400, detail=f"LLM error: {e}")
+
+    cy = out.cypher.strip()
+    if not cy:
+        raise HTTPException(400, detail="LLM returned empty Cypher")
+
+    head = cy.split(None, 1)[0].upper()
+    is_read = head in {"MATCH", "OPTIONAL", "UNWIND", "CALL", "WITH", "RETURN"}
+
+    # 2) Execute
+    drv = _neo4j_driver()
+    with drv.session(database=_settings.NEO4J_DATABASE) as ses:
+        try:
+            result = ses.run(cy)
+        except Exception as e:
+            raise HTTPException(400, detail=f"Cypher failed: {e}")
+
+        if is_read:
+            rows = [list(rec.values()) for rec in result]
+            return {"cypher": cy, "rows": rows}
+        else:
+            return {"cypher": cy, "status": "✅ write applied"}
