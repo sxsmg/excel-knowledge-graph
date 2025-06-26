@@ -1,8 +1,0 @@
-html,body{margin:0;font-family:system-ui}
-#toolbar{
-  display:flex;gap:.5rem;padding:.5rem;background:#fafafa;border-bottom:1px solid #ddd
-}
-#toolbar input{flex:1;padding:.4rem;border:1px solid #ccc;border-radius:4px}
-#toolbar button{padding:.45rem .9rem;border:0;background:#007acc;color:#fff;border-radius:4px;cursor:pointer}
-#viz{width:100%;height:calc(100vh - 48px);}
-#answer{padding:.6rem .8rem;font-size:.9rem;color:#333;border-top:1px solid #eee}

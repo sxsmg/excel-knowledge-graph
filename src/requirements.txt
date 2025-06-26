@@ -13,3 +13,4 @@ pyvis
 watchdog
 python-dotenv
 typer
+sse-starlette

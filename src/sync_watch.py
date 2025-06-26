@@ -4,7 +4,7 @@ from watchdog.events import FileSystemEventHandler
 
 from .ingest import build_nx_graph
 from .graph_store import clear_db, upsert_graph
-
+import requests
 
 class _Handler(FileSystemEventHandler):
     def __init__(self, path):
@@ -16,6 +16,7 @@ class _Handler(FileSystemEventHandler):
             gx = build_nx_graph(str(self.path))
             clear_db()
             upsert_graph(gx)
+            requests.post("http://localhost:8000/notify_update")
             print("✅  Graph reloaded")
 
 
@@ -24,7 +25,6 @@ def main(xlsx_path: str):
     gx = build_nx_graph(str(p))
     clear_db()
     upsert_graph(gx)
-
     obs = Observer()
     obs.schedule(_Handler(p), p.parent, recursive=False)
     obs.start()
