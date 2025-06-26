@@ -26,6 +26,15 @@ app.get("/config", (_req, res) => {
     password : process.env.NEO4J_PASSWORD ?? "password"
   });
 });
+// viewer/server.js
+app.get("/vis-network.min.js", (_req, res) => {
+  res.sendFile(
+    path.join(
+      __dirname,
+      "node_modules/vis-network/standalone/umd/vis-network.min.js"
+    )
+  );
+});
 
 app.listen(3000, () =>
   console.log("🚀  Graph viewer running → http://localhost:3000")

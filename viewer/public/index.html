@@ -1,64 +1,109 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Spreadsheet Dependency Graph</title>
+  <meta charset="utf-8" />
+  <title>Spreadsheet-Brain Viewer</title>
 
   <style>
-    #viz{width:100%;max-width:1100px;height:700px;margin:2rem auto;border:1px solid #ccc}
-    #askbox{display:flex;gap:.5rem;justify-content:center;margin-top:1rem;font-family:system-ui,sans-serif}
-    #answer{margin-top:.75rem;text-align:center;font-weight:600}
+    body{font-family:system-ui;margin:0}
+    #toolbar{display:flex;gap:6px;align-items:center;
+             padding:8px;background:#fafafa;border-bottom:1px solid #ddd}
+    #query{flex:1;padding:6px;font-size:14px}
+    button{padding:6px 14px;font-size:14px;cursor:pointer}
+    #status{font-size:12px;color:#555;margin-left:4px;user-select:none}
+    #answer{position:absolute;top:56px;right:16px;max-width:320px;
+            background:#fff;border:1px solid #ccc;border-radius:4px;
+            padding:8px;font-size:14px;box-shadow:0 2px 6px rgba(0,0,0,.12);display:none}
+    #viz{width:100%;height:calc(100vh - 50px)}
   </style>
 
-  <script src="/neovis.js"></script>  <!--  full bundle, no vis-network tag -->
+  <!-- bundles served by server.js -->
+  <script src="/neovis.js"></script>
+  <script src="/vis-network.min.js"></script>
 </head>
-<body onload="draw()">
-  <div id="viz"></div>
 
-  <!-- quick NL-query box -->
-  <div id="askbox">
-    <input id="q" size="60"
-           placeholder="Ask something like: Which cells break if I change Sales!C2?">
-    <button onclick="submitQ()">Ask</button>
+<body onload="init()">
+  <!-- ───────────── toolbar ───────────── -->
+  <div id="toolbar">
+    <input  id="query"
+            placeholder="Ask or update (e.g. 'Which cells break if I change Sales!C2?')"/>
+    <button onclick="sendAsk()">Ask</button>
+    <button onclick="sendUpdate()">Update</button>
+    <button onclick="draw()">Reload</button>
+    <span id="status"></span>
   </div>
+
+  <!-- answer bubble -->
   <div id="answer"></div>
 
-  <script>
-    let viz;
+  <!-- graph canvas -->
+  <div id="viz"></div>
 
-    async function draw(){
-      const cfg = await fetch("/config").then(r=>r.json())
-                                       .catch(()=>null);
-      if(!cfg){return document.getElementById("viz").innerText="❌  /config missing";}
+<script>
+let viz, cfg;
+const BASE_URL = "http://localhost:8000";   // FastAPI base
 
-      const config = {
-        containerId : "viz",
-        neo4j : { serverUrl:cfg.uri, serverUser:cfg.user, serverPassword:cfg.password },
-        initialCypher : "MATCH (n)-[r]->(m) RETURN n,r,m LIMIT 300"
-      };
+async function init () {
+  cfg   = await fetch("/config").then(r => r.json());
+  const meta = await fetch(`${BASE_URL}/labels`).then(r => r.json());
 
-      viz = new NeoVis.default(config);
-      viz.render();
+  console.log(meta);   // { nodeLabels:["entity"], relTypes:["DEPENDS_ON"] }
+  draw(meta);
+}
 
-      /* optional: strip vis network’s old-school CSS */
-      viz.registerOnEvent("completed", () =>
-        document.querySelectorAll("style[type*='text/css']").forEach(s=>s.remove())
-      );
-    }
+function draw(meta){
+  const config = {
+    containerId:"viz",
+    neo4j:{serverUrl:cfg.uri,serverUser:cfg.user,serverPassword:cfg.password},
+    labels : Object.fromEntries(
+       meta.nodeLabels.map(l => [l,{ caption:"name" }])
+    ),
+    relationships:{},
+    initialCypher:"MATCH (n)-[r]->(m) RETURN n,r,m LIMIT 300"
+  };
+  if(!window.NeoVis?.default){ return setStatus("❌ NeoVis missing"); }
+  setStatus("Rendering…");
+  viz = new NeoVis.default(config);
+  viz.render();
+  viz.registerOnEvent("completed", () => setStatus("✅ graph ready"));
+}
 
-    async function submitQ(){
-      const question = document.getElementById("q").value.trim();
-      if(!question) return;
-      document.getElementById("answer").innerText = "…thinking…";
-      try{
-        const res = await fetch("/ask",
-          {method:"POST",headers:{"Content-Type":"application/json"},
-           body:JSON.stringify({question})}).then(r=>r.json());
-        document.getElementById("answer").innerText = res.answer ?? "⚠️ No answer";
-      }catch(e){
-        document.getElementById("answer").innerText = "⚠️ API error";
-      }
-    }
-  </script>
+/*──────────────────── helpers ──────────────────────────*/
+const qEl = ()=>document.getElementById("query");
+const ans = ()=>document.getElementById("answer");
+function setStatus(txt){document.getElementById("status").textContent=txt;}
+
+/*──────────────────── /ask ─────────────────────────────*/
+async function sendAsk(){
+  const question=qEl().value.trim();
+  if(!question){return;}
+  setStatus("⏳ asking…"); ans().style.display="none";
+  try{
+    const res=await fetch(`${BASE_URL}/ask`,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({question})}).then(r=>r.json());
+    ans().textContent=res.answer||"No answer";
+    ans().style.display="block";
+    setStatus("✅ answered");
+  }catch(e){setStatus("❌ "+e.message);}
+}
+
+/*──────────────────── /update ──────────────────────────*/
+async function sendUpdate(){
+  const instruction=qEl().value.trim();
+  if(!instruction){return;}
+  setStatus("⏳ updating…"); ans().style.display="none";
+  try{
+    const res=await fetch(`${BASE_URL}/update`,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({instruction})}).then(r=>r.json());
+    if(res.cypher){setStatus("✅ "+res.cypher); draw();}
+    else{throw new Error(res.detail||"update failed");}
+  }catch(e){setStatus("❌ "+e.message);}
+}
+
+/* optional: “Enter” key triggers Ask */
+document.addEventListener("keydown",e=>{
+  if(e.key==="Enter"&&document.activeElement===qEl()){sendAsk();}
+});
+</script>
 </body>
 </html>
